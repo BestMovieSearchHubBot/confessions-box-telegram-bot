@@ -15,7 +15,6 @@ if (!BOT_TOKEN || !MONGODB_URI) {
   process.exit(1);
 }
 
-// Global variable to store bot username to fix "undefined" link issue
 let cachedBotUsername = "";
 
 mongoose.connect(MONGODB_URI, {
@@ -177,7 +176,6 @@ async function awardReferralCommission(spenderUserId, amountStars) {
 // ========== BOT INSTANCE ==========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Fetch bot username once on startup
 bot.getMe().then((me) => {
   cachedBotUsername = me.username;
   console.log(`🤖 Bot started as @${cachedBotUsername}`);
@@ -195,7 +193,6 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const username = msg.from.username || msg.from.first_name;
   const param = match[1];
 
-  // Fix: Ensure we have the bot username
   if (!cachedBotUsername) {
     const me = await bot.getMe();
     cachedBotUsername = me.username;
@@ -222,9 +219,27 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
 
   const token = await ensureUser(userId, username);
   const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
+  const shareButtons = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📱 WhatsApp", url: `https://wa.me/?text=Check%20out%20my%20anonymous%20inbox%20on%20Telegram%3A%20${encodeURIComponent(profileLink)}` },
+          { text: "✈️ Telegram", url: `https://t.me/share/url?url=${encodeURIComponent(profileLink)}&text=Send%20me%20anonymous%20messages%20here!` }
+        ],
+        [
+          { text: "📘 Facebook", url: `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(profileLink)}` },
+          { text: "📷 Instagram", callback_data: `copy_link_${token}` }
+        ],
+        [
+          { text: "🔗 Copy Link", callback_data: `copy_link_${token}` }
+        ]
+      ]
+    }
+  };
+
   await bot.sendMessage(chatId,
-    `🎉 *Your anonymous inbox is ready!*\n\nShare this link with friends, followers, or anyone:\n${profileLink}\n\nWhen they click it, they can send you anonymous messages. You'll get a blurred preview and can unlock each message for free (by sharing the bot) or with Telegram Stars.\n\n📊 Use /status to see pending messages.\n🎁 Use /random to send an anonymous message to a random user.\n🏆 Use /rank to see leaderboard.\n💡 Use /portrait to generate a shareable friend portrait (after 5+ messages).`,
-    { parse_mode: "Markdown", disable_web_page_preview: true }
+    `🎉 *Your anonymous inbox is ready!*\n\nShare your link with friends, followers, or anyone using the buttons below. They can send you anonymous messages. You'll get a blurred preview and can unlock each message for free (by sharing the bot) or with Telegram Stars.\n\n📊 Use /status to see pending messages.\n🎁 Use /random to send an anonymous message to a random user.\n🏆 Use /rank to see leaderboard.\n💡 Use /portrait to generate a shareable friend portrait (after 5+ messages).`,
+    { parse_mode: "Markdown", ...shareButtons }
   );
 });
 
@@ -381,8 +396,21 @@ bot.on("callback_query", async (query) => {
     await bot.sendInvoice(invoice);
     await bot.answerCallbackQuery(query.id);
   }
+
+  else if (data.startsWith("copy_link_")) {
+    const token = data.split("_")[2];
+    const user = await User.findOne({ token });
+    if (!user) {
+      await bot.answerCallbackQuery(query.id, { text: "Link not found." });
+      return;
+    }
+    const link = `https://t.me/${cachedBotUsername}?start=${token}`;
+    await bot.sendMessage(chatId, `🔗 *Your anonymous inbox link:*\n${link}\n\nShare it anywhere by copying this message.`, { parse_mode: "Markdown", disable_web_page_preview: true });
+    await bot.answerCallbackQuery(query.id, { text: "Link sent! Long-press to copy." });
+  }
 });
 
+// ========== PAYMENT HANDLERS ==========
 bot.on("pre_checkout_query", (query) => bot.answerPreCheckoutQuery(query.id, true));
 
 bot.on("successful_payment", async (msg) => {
@@ -404,6 +432,7 @@ bot.on("successful_payment", async (msg) => {
   }
 });
 
+// ========== DAILY CLEANUP ==========
 setInterval(async () => {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   await RateLimit.deleteMany({ date: { $lt: yesterday } });
