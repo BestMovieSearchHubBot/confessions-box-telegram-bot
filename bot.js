@@ -8,12 +8,15 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const OWNER_ID = process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : 6252869088;
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL; // e.g., https://your-app.onrender.com
+const BASE_URL = process.env.BASE_URL;
 
 if (!BOT_TOKEN || !MONGODB_URI) {
   console.error("❌ Missing BOT_TOKEN or MONGODB_URI");
   process.exit(1);
 }
+
+// Global variable to store bot username to fix "undefined" link issue
+let cachedBotUsername = "";
 
 mongoose.connect(MONGODB_URI, {
   useNewUrlParser: true,
@@ -35,8 +38,8 @@ const userSchema = new mongoose.Schema({
   age: { type: Number, default: null },
   gender: { type: String, default: "" },
   privacy: { showLocation: Boolean, showAge: Boolean, default: {} },
-  referredBy: { type: Number, default: null },          // userId of referrer
-  referralEarningsStars: { type: Number, default: 0 },  // total Stars earned from referrals
+  referredBy: { type: Number, default: null },
+  referralEarningsStars: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
   lastActive: { type: Date, default: Date.now }
 });
@@ -44,7 +47,7 @@ const User = mongoose.model("User", userSchema);
 
 const messageSchema = new mongoose.Schema({
   receiverId: { type: Number, required: true },
-  senderToken: { type: String, required: true },       // anonymous token for reply
+  senderToken: { type: String, required: true },
   content: { type: String, required: true },
   preview: { type: String, required: true },
   status: { type: String, enum: ["pending", "unlocked"], default: "pending" },
@@ -65,11 +68,10 @@ const paymentSchema = new mongoose.Schema({
 });
 const Payment = mongoose.model("Payment", paymentSchema);
 
-// Rate limit schema (per sender per recipient per day)
 const rateLimitSchema = new mongoose.Schema({
   senderId: { type: Number, required: true },
   recipientId: { type: Number, required: true },
-  date: { type: String, required: true }, // YYYY-MM-DD
+  date: { type: String, required: true },
   count: { type: Number, default: 0 }
 });
 rateLimitSchema.index({ senderId: 1, recipientId: 1, date: 1 }, { unique: true });
@@ -119,19 +121,16 @@ async function createMessage(receiverId, content, senderToken) {
   return message;
 }
 
-// Rate limit check
 async function checkRateLimit(senderId, recipientId) {
   const today = new Date().toISOString().slice(0, 10);
   const perRecipient = await RateLimit.findOne({ senderId, recipientId, date: today });
-  if (perRecipient && perRecipient.count >= 3) return false; // max 3 to same recipient
-
+  if (perRecipient && perRecipient.count >= 3) return false;
   const totalToday = await RateLimit.aggregate([
     { $match: { senderId, date: today } },
     { $group: { _id: null, total: { $sum: "$count" } } }
   ]);
   const total = totalToday[0]?.total || 0;
-  if (total >= 10) return false; // max 10 total per day
-
+  if (total >= 10) return false;
   return true;
 }
 
@@ -144,11 +143,9 @@ async function incrementRateLimit(senderId, recipientId) {
   );
 }
 
-// Friend Portrait generator (simple word frequency)
 async function generateFriendPortrait(userId, userDisplayName) {
   const messages = await Message.find({ receiverId: userId, status: "unlocked" }).limit(50);
   if (messages.length < 5) return null;
-
   const allText = messages.map(m => m.content.toLowerCase()).join(" ");
   const words = allText.split(/\W+/).filter(w => w.length > 3);
   const stopwords = new Set(["the","this","that","with","from","have","like","just","what","when","how","really","very","about","your","you"]);
@@ -159,27 +156,19 @@ async function generateFriendPortrait(userId, userDisplayName) {
   }
   const sorted = Object.entries(freq).sort((a,b) => b[1] - a[1]).slice(0, 5);
   if (sorted.length === 0) return null;
-
   const topWords = sorted.map(([w]) => w).join(", ");
-  const text = `🧠 *Friend Portrait for ${userDisplayName}*\n\nBased on ${messages.length} anonymous messages, people often describe you as: *${topWords}*.\n\nKeep sharing your link to get more insights! 🌟`;
-  return text;
+  return `🧠 *Friend Portrait for ${userDisplayName}*\n\nBased on ${messages.length} anonymous messages, people often describe you as: *${topWords}*.\n\nKeep sharing your link to get more insights! 🌟`;
 }
 
-// Award referral commission (15% of spent Stars)
 async function awardReferralCommission(spenderUserId, amountStars) {
   const spender = await User.findOne({ userId: spenderUserId });
   if (!spender || !spender.referredBy) return;
-
   const referrer = await User.findOne({ userId: spender.referredBy });
   if (!referrer) return;
-
   const commission = Math.floor(amountStars * 0.15);
   if (commission <= 0) return;
-
   referrer.referralEarningsStars += commission;
   await referrer.save();
-
-  // Notify referrer
   try {
     await bot.sendMessage(referrer.userId, `🎉 *Referral reward!* Your friend spent ${amountStars} Stars. You earned ${commission} Stars commission!`, { parse_mode: "Markdown" });
   } catch (e) {}
@@ -187,6 +176,12 @@ async function awardReferralCommission(spenderUserId, amountStars) {
 
 // ========== BOT INSTANCE ==========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// Fetch bot username once on startup
+bot.getMe().then((me) => {
+  cachedBotUsername = me.username;
+  console.log(`🤖 Bot started as @${cachedBotUsername}`);
+});
 
 // ========== EXPRESS SERVER ==========
 const app = express();
@@ -200,24 +195,24 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   const username = msg.from.username || msg.from.first_name;
   const param = match[1];
 
-  // Handle referral link start=ref_123
+  // Fix: Ensure we have the bot username
+  if (!cachedBotUsername) {
+    const me = await bot.getMe();
+    cachedBotUsername = me.username;
+  }
+
   if (param && param.startsWith("ref_")) {
     const referrerId = parseInt(param.slice(4));
     await ensureUser(userId, username, null, referrerId);
     await bot.sendMessage(chatId, `👋 Welcome! You were invited by a friend. Your inbox is ready. Share your link to start receiving anonymous messages.`);
-    // Continue with normal flow
   }
 
-  // If param is a profile token
   if (param && !param.startsWith("ref_")) {
     const user = await getUserByToken(param);
     if (user) {
-      // Show form to send anonymous message to this user
       const keyboard = {
         reply_markup: {
-          inline_keyboard: [
-            [{ text: "✍️ Send anonymous message", callback_data: `send_to_${user.userId}` }]
-          ]
+          inline_keyboard: [[{ text: "✍️ Send anonymous message", callback_data: `send_to_${user.userId}` }]]
         }
       };
       await bot.sendMessage(chatId, `📝 Send an anonymous message to @${user.username || user.displayName}`, keyboard);
@@ -225,9 +220,8 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     }
   }
 
-  // Normal start
   const token = await ensureUser(userId, username);
-  const profileLink = `https://t.me/${bot.getMe().username}?start=${token}`;
+  const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
   await bot.sendMessage(chatId,
     `🎉 *Your anonymous inbox is ready!*\n\nShare this link with friends, followers, or anyone:\n${profileLink}\n\nWhen they click it, they can send you anonymous messages. You'll get a blurred preview and can unlock each message for free (by sharing the bot) or with Telegram Stars.\n\n📊 Use /status to see pending messages.\n🎁 Use /random to send an anonymous message to a random user.\n🏆 Use /rank to see leaderboard.\n💡 Use /portrait to generate a shareable friend portrait (after 5+ messages).`,
     { parse_mode: "Markdown", disable_web_page_preview: true }
@@ -244,14 +238,12 @@ bot.onText(/\/status/, async (msg) => {
 bot.onText(/\/random/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  // Find active user who is not the sender and has received at least 1 message (to avoid bots)
   const activeUser = await User.findOne({ userId: { $ne: userId }, lastActive: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }).sort({ lastActive: -1 }).limit(1);
   if (!activeUser) {
     await bot.sendMessage(chatId, "No active users found. Try again later.");
     return;
   }
   await bot.sendMessage(chatId, "✍️ Type your anonymous message (max 500 chars):", { reply_markup: { force_reply: true } });
-  // Store target user in memory for this reply
   global.pendingRandomTarget = activeUser.userId;
 });
 
@@ -296,7 +288,6 @@ bot.onText(/\/portrait/, async (msg) => {
   }
 });
 
-// Owner stats
 bot.onText(/\/stats/, async (msg) => {
   if (msg.from.id !== OWNER_ID) {
     await bot.sendMessage(msg.chat.id, "❌ You are not authorized.");
@@ -314,36 +305,23 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
   const userId = msg.from.id;
+  if (!text || text.startsWith("/")) return;
 
-  if (!text) return;
-
-  // Handle reply for /random
   if (msg.reply_to_message && msg.reply_to_message.text && msg.reply_to_message.text.includes("Type your anonymous message")) {
-    const targetId = global.pendingRandomTarget;
+    const targetId = global.pendingRandomTarget || global.pendingTargetUserId;
     if (!targetId) return;
     const canSend = await checkRateLimit(userId, targetId);
     if (!canSend) {
-      await bot.sendMessage(chatId, "❌ You've reached your daily message limit (max 3 to same person, 10 total). Try again tomorrow.");
-      delete global.pendingRandomTarget;
+      await bot.sendMessage(chatId, "❌ You've reached your daily limit. Try again tomorrow.");
       return;
     }
     const senderToken = generateToken();
     await createMessage(targetId, text, senderToken);
     await incrementRateLimit(userId, targetId);
     await bot.sendMessage(chatId, "✅ Message sent anonymously.");
-    // Notify recipient
-    try {
-      await bot.sendMessage(targetId, "📩 You have a new anonymous message! Use /status to see it.");
-    } catch (e) {}
+    try { await bot.sendMessage(targetId, "📩 You have a new anonymous message! Use /status to see it."); } catch (e) {}
     delete global.pendingRandomTarget;
-    return;
-  }
-
-  // Handle reply to an unlocked message (we'll store reply)
-  if (msg.reply_to_message && msg.reply_to_message.text && msg.reply_to_message.text.includes("Reply to this message to answer")) {
-    // For simplicity, we just notify that reply is stored (advanced version would forward)
-    await bot.sendMessage(chatId, "✅ Your reply has been stored. The sender will see it when they check their messages (future feature).");
-    return;
+    delete global.pendingTargetUserId;
   }
 });
 
@@ -357,48 +335,39 @@ bot.on("callback_query", async (query) => {
     const targetUserId = parseInt(data.split("_")[2]);
     const canSend = await checkRateLimit(userId, targetUserId);
     if (!canSend) {
-      await bot.answerCallbackQuery(query.id, { text: "Daily limit reached (3 per person, 10 total). Try tomorrow." });
+      await bot.answerCallbackQuery(query.id, { text: "Limit reached." });
       return;
     }
-    // Ask for message
     await bot.sendMessage(chatId, "✍️ Type your anonymous message (max 500 chars):", { reply_markup: { force_reply: true } });
     global.pendingTargetUserId = targetUserId;
     await bot.answerCallbackQuery(query.id);
   }
 
-  // Unlock by share (free)
   else if (data.startsWith("unlock_share_")) {
     const messageId = data.split("_")[2];
     const message = await Message.findById(messageId);
-    if (!message || message.status !== "pending") {
-      await bot.answerCallbackQuery(query.id, { text: "Message not found or already unlocked." });
-      return;
-    }
+    if (!message || message.status !== "pending") return;
+
     message.status = "unlocked";
     message.unlockMethod = "share";
     message.unlockedAt = new Date();
     await message.save();
 
     const user = await User.findOne({ userId });
-    const referralLink = `https://t.me/${bot.getMe().username}?start=ref_${user.userId}`;
-    // Send full message
+    const refLink = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
+    
     await bot.editMessageText(`📩 *Anonymous message (unlocked)*\n\n*"${message.content}"*`, {
       chat_id: chatId,
       message_id: query.message.message_id,
       parse_mode: "Markdown"
     });
-    await bot.sendMessage(chatId, `🎉 Message unlocked! Share your link to get more messages: ${referralLink}`, { disable_web_page_preview: true });
-    await bot.answerCallbackQuery(query.id, { text: "Message unlocked! Share to get more." });
+    await bot.sendMessage(chatId, `🎉 Message unlocked! Share your link: ${refLink}`, { disable_web_page_preview: true });
   }
 
-  // Unlock by Stars
   else if (data.startsWith("unlock_stars_")) {
     const messageId = data.split("_")[2];
     const message = await Message.findById(messageId);
-    if (!message || message.status !== "pending") {
-      await bot.answerCallbackQuery(query.id, { text: "Message not found or already unlocked." });
-      return;
-    }
+    if (!message || message.status !== "pending") return;
     const invoice = {
       chat_id: chatId,
       title: "Unlock Anonymous Message",
@@ -406,25 +375,20 @@ bot.on("callback_query", async (query) => {
       payload: `unlock_pay_${messageId}`,
       provider_token: "",
       currency: "XTR",
-      prices: [{ label: "Unlock", amount: 1500 }], // 15 Stars
-      start_parameter: "unlock",
-      need_shipping_address: false,
-      is_flexible: false
+      prices: [{ label: "Unlock", amount: 1500 }],
+      start_parameter: "unlock"
     };
     await bot.sendInvoice(invoice);
     await bot.answerCallbackQuery(query.id);
   }
 });
 
-// ========== PAYMENTS ==========
-bot.on("pre_checkout_query", async (query) => {
-  await bot.answerPreCheckoutQuery(query.id, true);
-});
+bot.on("pre_checkout_query", (query) => bot.answerPreCheckoutQuery(query.id, true));
 
 bot.on("successful_payment", async (msg) => {
   const payload = msg.successful_payment.invoice_payload;
   const userId = msg.from.id;
-  const amountStars = msg.successful_payment.total_amount / 100; // 15 Stars = 1500
+  const amountStars = msg.successful_payment.total_amount / 100;
   if (payload.startsWith("unlock_pay_")) {
     const messageId = payload.split("_")[2];
     const message = await Message.findById(messageId);
@@ -433,26 +397,16 @@ bot.on("successful_payment", async (msg) => {
       message.unlockMethod = "stars";
       message.unlockedAt = new Date();
       await message.save();
-      await new Payment({
-        userId,
-        transactionId: msg.successful_payment.telegram_payment_charge_id,
-        amountStars,
-        type: "unlock",
-        messageId: message._id
-      }).save();
-      // Award referral commission
+      await new Payment({ userId, transactionId: msg.successful_payment.telegram_payment_charge_id, amountStars, type: "unlock", messageId: message._id }).save();
       await awardReferralCommission(userId, amountStars);
       await bot.sendMessage(msg.chat.id, `🎉 *Message unlocked!*\n\n*"${message.content}"*`, { parse_mode: "Markdown" });
     }
   }
 });
 
-// ========== DAILY RATE LIMIT RESET (run once a day) ==========
 setInterval(async () => {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   await RateLimit.deleteMany({ date: { $lt: yesterday } });
-  console.log("Rate limit data cleaned up");
 }, 24 * 60 * 60 * 1000);
 
-// ========== START ==========
 console.log("🤖 Bot started...");
