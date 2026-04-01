@@ -232,6 +232,9 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
         ],
         [
           { text: "🔗 Copy Link", callback_data: `copy_link_${token}` }
+        ],
+        [
+          { text: "🤝 Affiliate Program (15%)", callback_data: "affiliate_info" }
         ]
       ]
     }
@@ -407,6 +410,27 @@ bot.on("callback_query", async (query) => {
     const link = `https://t.me/${cachedBotUsername}?start=${token}`;
     await bot.sendMessage(chatId, `🔗 *Your anonymous inbox link:*\n${link}\n\nShare it anywhere by copying this message.`, { parse_mode: "Markdown", disable_web_page_preview: true });
     await bot.answerCallbackQuery(query.id, { text: "Link sent! Long-press to copy." });
+  }
+
+  // 👇 AFFILIATE INFO HANDLER (like the screenshot popup)
+  else if (data === "affiliate_info") {
+    const user = await User.findOne({ userId });
+    if (!user) {
+      await bot.answerCallbackQuery(query.id, { text: "Error fetching user." });
+      return;
+    }
+    const link = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
+    const earnings = user.referralEarningsStars || 0;
+    const affiliateText = `🤝 *Affiliate Program*\n\nEarn *15%* commission when friends spend Stars!\n\nYour referral link:\n\`${link}\`\n\nTotal earned: ${earnings} Stars\n\nShare your link and start earning!`;
+    const keyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔗 Copy Link", callback_data: `copy_link_${user.token}` }]
+        ]
+      }
+    };
+    await bot.sendMessage(chatId, affiliateText, { parse_mode: "Markdown", disable_web_page_preview: true, ...keyboard });
+    await bot.answerCallbackQuery(query.id);
   }
 });
 
