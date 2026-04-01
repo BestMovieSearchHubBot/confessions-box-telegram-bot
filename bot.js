@@ -183,7 +183,29 @@ bot.getMe().then((me) => {
 
 // ========== EXPRESS SERVER ==========
 const app = express();
+app.use(express.static('public')); // 👈 Serve static files from "public" folder
+
+// Health check
 app.get("/", (req, res) => res.send("✅ Bot is running"));
+
+// API endpoints for the Mini App
+app.get('/api/affiliate/:userId', async (req, res) => {
+  const userId = parseInt(req.params.userId);
+  const user = await User.findOne({ userId });
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const referralLink = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
+  res.json({
+    referralLink,
+    earningsStars: user.referralEarningsStars || 0
+  });
+});
+
+app.post('/api/affiliate/join/:userId', async (req, res) => {
+  // Optional: store a flag that the user has joined the affiliate program
+  // For now, just return ok
+  res.json({ status: 'ok' });
+});
+
 app.listen(PORT, () => console.log(`Express server running on port ${PORT}`));
 
 // ========== COMMANDS ==========
@@ -234,7 +256,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
           { text: "🔗 Copy Link", callback_data: `copy_link_${token}` }
         ],
         [
-          { text: "🤝 Affiliate Program (15%)", callback_data: "affiliate_info" }
+          { text: "🤝 Affiliate Program (15%)", web_app: { url: `${BASE_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`}/affiliate` } }
         ]
       ]
     }
@@ -412,7 +434,6 @@ bot.on("callback_query", async (query) => {
     await bot.answerCallbackQuery(query.id, { text: "Link sent! Long-press to copy." });
   }
 
-  // 👇 AFFILIATE INFO HANDLER (like the screenshot popup)
   else if (data === "affiliate_info") {
     const user = await User.findOne({ userId });
     if (!user) {
