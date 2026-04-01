@@ -37,8 +37,6 @@ const userSchema = new mongoose.Schema({
   age: { type: Number, default: null },
   gender: { type: String, default: "" },
   privacy: { showLocation: Boolean, showAge: Boolean, default: {} },
-  referredBy: { type: Number, default: null },
-  referralEarningsStars: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
   lastActive: { type: Date, default: Date.now }
 });
@@ -81,7 +79,7 @@ function generateToken() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-async function ensureUser(userId, username, displayName = null, referredBy = null) {
+async function ensureUser(userId, username, displayName = null) {
   let user = await User.findOne({ userId });
   if (user) {
     user.lastActive = new Date();
@@ -96,7 +94,6 @@ async function ensureUser(userId, username, displayName = null, referredBy = nul
     username: username || "",
     displayName: displayName || (username ? username : `User ${userId}`),
     token,
-    referredBy: referredBy || null,
     createdAt: new Date()
   });
   await user.save();
@@ -159,20 +156,6 @@ async function generateFriendPortrait(userId, userDisplayName) {
   return `🧠 *Friend Portrait for ${userDisplayName}*\n\nBased on ${messages.length} anonymous messages, people often describe you as: *${topWords}*.\n\nKeep sharing your link to get more insights! 🌟`;
 }
 
-async function awardReferralCommission(spenderUserId, amountStars) {
-  const spender = await User.findOne({ userId: spenderUserId });
-  if (!spender || !spender.referredBy) return;
-  const referrer = await User.findOne({ userId: spender.referredBy });
-  if (!referrer) return;
-  const commission = Math.floor(amountStars * 0.15);
-  if (commission <= 0) return;
-  referrer.referralEarningsStars += commission;
-  await referrer.save();
-  try {
-    await bot.sendMessage(referrer.userId, `🎉 *Referral reward!* Your friend spent ${amountStars} Stars. You earned ${commission} Stars commission!`, { parse_mode: "Markdown" });
-  } catch (e) {}
-}
-
 // ========== BOT INSTANCE ==========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
@@ -183,28 +166,9 @@ bot.getMe().then((me) => {
 
 // ========== EXPRESS SERVER ==========
 const app = express();
-app.use(express.static('public')); // 👈 Serve static files from "public" folder
+app.use(express.static('public')); // keep only if you have other static files, but no affiliate
 
-// Health check
 app.get("/", (req, res) => res.send("✅ Bot is running"));
-
-// API endpoints for the Mini App
-app.get('/api/affiliate/:userId', async (req, res) => {
-  const userId = parseInt(req.params.userId);
-  const user = await User.findOne({ userId });
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  const referralLink = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
-  res.json({
-    referralLink,
-    earningsStars: user.referralEarningsStars || 0
-  });
-});
-
-app.post('/api/affiliate/join/:userId', async (req, res) => {
-  // Optional: store a flag that the user has joined the affiliate program
-  // For now, just return ok
-  res.json({ status: 'ok' });
-});
 
 app.listen(PORT, () => console.log(`Express server running on port ${PORT}`));
 
@@ -221,9 +185,9 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   }
 
   if (param && param.startsWith("ref_")) {
-    const referrerId = parseInt(param.slice(4));
-    await ensureUser(userId, username, null, referrerId);
-    await bot.sendMessage(chatId, `👋 Welcome! You were invited by a friend. Your inbox is ready. Share your link to start receiving anonymous messages.`);
+    // referral links are no longer supported, but we can ignore them
+    await bot.sendMessage(chatId, `👋 Welcome! Your inbox is ready. Share your link to start receiving anonymous messages.`);
+    return;
   }
 
   if (param && !param.startsWith("ref_")) {
@@ -254,9 +218,6 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
         ],
         [
           { text: "🔗 Copy Link", callback_data: `copy_link_${token}` }
-        ],
-        [
-          { text: "🤝 Affiliate Program (15%)", web_app: { url: `${BASE_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`}/affiliate` } }
         ]
       ]
     }
@@ -433,26 +394,6 @@ bot.on("callback_query", async (query) => {
     await bot.sendMessage(chatId, `🔗 *Your anonymous inbox link:*\n${link}\n\nShare it anywhere by copying this message.`, { parse_mode: "Markdown", disable_web_page_preview: true });
     await bot.answerCallbackQuery(query.id, { text: "Link sent! Long-press to copy." });
   }
-
-  else if (data === "affiliate_info") {
-    const user = await User.findOne({ userId });
-    if (!user) {
-      await bot.answerCallbackQuery(query.id, { text: "Error fetching user." });
-      return;
-    }
-    const link = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
-    const earnings = user.referralEarningsStars || 0;
-    const affiliateText = `🤝 *Affiliate Program*\n\nEarn *15%* commission when friends spend Stars!\n\nYour referral link:\n\`${link}\`\n\nTotal earned: ${earnings} Stars\n\nShare your link and start earning!`;
-    const keyboard = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🔗 Copy Link", callback_data: `copy_link_${user.token}` }]
-        ]
-      }
-    };
-    await bot.sendMessage(chatId, affiliateText, { parse_mode: "Markdown", disable_web_page_preview: true, ...keyboard });
-    await bot.answerCallbackQuery(query.id);
-  }
 });
 
 // ========== PAYMENT HANDLERS ==========
@@ -471,7 +412,7 @@ bot.on("successful_payment", async (msg) => {
       message.unlockedAt = new Date();
       await message.save();
       await new Payment({ userId, transactionId: msg.successful_payment.telegram_payment_charge_id, amountStars, type: "unlock", messageId: message._id }).save();
-      await awardReferralCommission(userId, amountStars);
+      // No referral commission any more
       await bot.sendMessage(msg.chat.id, `🎉 *Message unlocked!*\n\n*"${message.content}"*`, { parse_mode: "Markdown" });
     }
   }
