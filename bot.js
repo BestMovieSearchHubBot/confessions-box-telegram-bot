@@ -8,7 +8,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const OWNER_ID = process.env.OWNER_ID ? parseInt(process.env.OWNER_ID) : 6252869088;
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL;
 
 if (!BOT_TOKEN || !MONGODB_URI) {
   console.error("❌ Missing BOT_TOKEN or MONGODB_URI");
@@ -25,7 +24,7 @@ mongoose.connect(MONGODB_URI, {
 mongoose.connection.once("open", () => console.log("✅ MongoDB connected"));
 mongoose.connection.on("error", err => console.error("MongoDB error:", err));
 
-// ========== SCHEMAS ==========
+// ========== SCHEMAS (FIXED) ==========
 const userSchema = new mongoose.Schema({
   userId: { type: Number, required: true, unique: true },
   username: { type: String, default: "" },
@@ -42,13 +41,14 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
+// FIXED: unlockMethod ka default undefined rakha (null allowed nahi tha)
 const messageSchema = new mongoose.Schema({
   receiverId: { type: Number, required: true },
   senderToken: { type: String, required: true },
   content: { type: String, required: true },
   preview: { type: String, required: true },
   status: { type: String, enum: ["pending", "unlocked"], default: "pending" },
-  unlockMethod: { type: String, enum: ["share", "stars"], default: null },
+  unlockMethod: { type: String, enum: ["share", "stars"], default: undefined },
   reply: { type: String, default: "" },
   createdAt: { type: Date, default: Date.now },
   unlockedAt: { type: Date, default: null }
@@ -104,6 +104,7 @@ async function getUserByToken(token) {
   return User.findOne({ token });
 }
 
+// createMessage ab error nahi degi
 async function createMessage(receiverId, content, senderToken) {
   const preview = content.split(" ").slice(0, 5).join(" ");
   const message = new Message({
@@ -112,6 +113,7 @@ async function createMessage(receiverId, content, senderToken) {
     content,
     preview,
     status: "pending"
+    // unlockMethod intentionally not set → undefined, validation pass
   });
   await message.save();
   return message;
@@ -166,7 +168,7 @@ bot.getMe().then((me) => {
 
 // ========== EXPRESS SERVER ==========
 const app = express();
-app.use(express.static('public')); // keep only if you have other static files, but no affiliate
+app.use(express.static('public'));
 
 app.get("/", (req, res) => res.send("✅ Bot is running"));
 
@@ -185,7 +187,6 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   }
 
   if (param && param.startsWith("ref_")) {
-    // referral links are no longer supported, but we can ignore them
     await bot.sendMessage(chatId, `👋 Welcome! Your inbox is ready. Share your link to start receiving anonymous messages.`);
     return;
   }
@@ -412,7 +413,6 @@ bot.on("successful_payment", async (msg) => {
       message.unlockedAt = new Date();
       await message.save();
       await new Payment({ userId, transactionId: msg.successful_payment.telegram_payment_charge_id, amountStars, type: "unlock", messageId: message._id }).save();
-      // No referral commission any more
       await bot.sendMessage(msg.chat.id, `🎉 *Message unlocked!*\n\n*"${message.content}"*`, { parse_mode: "Markdown" });
     }
   }
