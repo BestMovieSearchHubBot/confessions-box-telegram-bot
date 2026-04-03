@@ -24,7 +24,7 @@ mongoose.connect(MONGODB_URI, {
 mongoose.connection.once("open", () => console.log("✅ MongoDB connected"));
 mongoose.connection.on("error", err => console.error("MongoDB error:", err));
 
-// ========== SCHEMAS (FIXED) ==========
+// ========== SCHEMAS ==========
 const userSchema = new mongoose.Schema({
   userId: { type: Number, required: true, unique: true },
   username: { type: String, default: "" },
@@ -41,7 +41,7 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
-// FIXED: unlockMethod ka default undefined rakha (null allowed nahi tha)
+// FIXED: unlockMethod default undefined (null allowed nahi tha)
 const messageSchema = new mongoose.Schema({
   receiverId: { type: Number, required: true },
   senderToken: { type: String, required: true },
@@ -104,16 +104,14 @@ async function getUserByToken(token) {
   return User.findOne({ token });
 }
 
-// createMessage ab error nahi degi
 async function createMessage(receiverId, content, senderToken) {
-  const preview = content.split(" ").slice(0, 5).join(" ");
+  const preview = content.split(" ").slice(0, 5).join(" ") + "...";
   const message = new Message({
     receiverId,
     senderToken,
     content,
     preview,
     status: "pending"
-    // unlockMethod intentionally not set → undefined, validation pass
   });
   await message.save();
   return message;
@@ -230,11 +228,48 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
   );
 });
 
+// UPDATED /status - shows a button to view pending messages
 bot.onText(/\/status/, async (msg) => {
   const userId = msg.from.id;
   const pending = await Message.countDocuments({ receiverId: userId, status: "pending" });
   const unlocked = await Message.countDocuments({ receiverId: userId, status: "unlocked" });
-  await bot.sendMessage(msg.chat.id, `📊 *Your Stats*\nPending messages: ${pending}\nUnlocked messages: ${unlocked}\nUse /mymessages to see list.`, { parse_mode: "Markdown" });
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: "📨 View pending messages", callback_data: "view_pending" }]
+    ]
+  };
+  await bot.sendMessage(msg.chat.id,
+    `📊 *Your Stats*\nPending messages: ${pending}\nUnlocked messages: ${unlocked}\nClick below to see and unlock messages.`,
+    { parse_mode: "Markdown", reply_markup: keyboard }
+  );
+});
+
+// UPDATED /mymessages - shows each message with unlock buttons
+bot.onText(/\/mymessages/, async (msg) => {
+  const userId = msg.from.id;
+  const messages = await Message.find({ receiverId: userId }).sort({ createdAt: -1 }).limit(10);
+  if (messages.length === 0) {
+    await bot.sendMessage(msg.chat.id, "No messages yet.");
+    return;
+  }
+  for (let m of messages) {
+    const statusEmoji = m.status === "unlocked" ? "🔓" : "🔒";
+    let text = `${statusEmoji} *${m.preview}*\n📅 ${new Date(m.createdAt).toLocaleString()}\n`;
+    let buttons = [];
+    if (m.status === "pending") {
+      buttons = [
+        [{ text: "🔓 Unlock by sharing", callback_data: `unlock_share_${m._id}` }],
+        [{ text: "⭐ Unlock with Stars", callback_data: `unlock_stars_${m._id}` }]
+      ];
+      text += `\n*Tap a button below to unlock the full message.*`;
+    } else {
+      text += `\n*Full message:* ${m.content}`;
+    }
+    await bot.sendMessage(msg.chat.id, text, {
+      parse_mode: "Markdown",
+      reply_markup: buttons.length ? { inline_keyboard: buttons } : undefined
+    });
+  }
 });
 
 bot.onText(/\/random/, async (msg) => {
@@ -260,20 +295,6 @@ bot.onText(/\/rank/, async (msg) => {
   for (let i = 0; i < topUsers.length; i++) {
     const u = topUsers[i];
     text += `${i+1}. ${u.displayName} – ${u.receivedCount} messages\n`;
-  }
-  await bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
-});
-
-bot.onText(/\/mymessages/, async (msg) => {
-  const userId = msg.from.id;
-  const messages = await Message.find({ receiverId: userId }).sort({ createdAt: -1 }).limit(10);
-  if (messages.length === 0) {
-    await bot.sendMessage(msg.chat.id, "No messages yet.");
-    return;
-  }
-  let text = "📜 *Your last 10 messages*\n\n";
-  for (let m of messages) {
-    text += `${m.status === "unlocked" ? "🔓" : "🔒"} ${m.preview}... (${new Date(m.createdAt).toLocaleString()})\n`;
   }
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
@@ -342,6 +363,26 @@ bot.on("callback_query", async (query) => {
     }
     await bot.sendMessage(chatId, "✍️ Type your anonymous message (max 500 chars):", { reply_markup: { force_reply: true } });
     global.pendingTargetUserId = targetUserId;
+    await bot.answerCallbackQuery(query.id);
+  }
+
+  else if (data === "view_pending") {
+    const userId = query.from.id;
+    const pendingMsgs = await Message.find({ receiverId: userId, status: "pending" }).sort({ createdAt: -1 });
+    if (pendingMsgs.length === 0) {
+      await bot.answerCallbackQuery(query.id, { text: "No pending messages." });
+      return;
+    }
+    for (let m of pendingMsgs) {
+      const text = `🔒 *${m.preview}*\n📅 ${new Date(m.createdAt).toLocaleString()}\n\nTap a button below to unlock.`;
+      const buttons = {
+        inline_keyboard: [
+          [{ text: "🔓 Unlock by sharing", callback_data: `unlock_share_${m._id}` }],
+          [{ text: "⭐ Unlock with Stars", callback_data: `unlock_stars_${m._id}` }]
+        ]
+      };
+      await bot.sendMessage(chatId, text, { parse_mode: "Markdown", reply_markup: buttons });
+    }
     await bot.answerCallbackQuery(query.id);
   }
 
