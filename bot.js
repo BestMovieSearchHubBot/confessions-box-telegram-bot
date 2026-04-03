@@ -41,7 +41,6 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
-// FIXED: unlockMethod default undefined (null allowed nahi tha)
 const messageSchema = new mongoose.Schema({
   receiverId: { type: Number, required: true },
   senderToken: { type: String, required: true },
@@ -73,6 +72,16 @@ const rateLimitSchema = new mongoose.Schema({
 });
 rateLimitSchema.index({ senderId: 1, recipientId: 1, date: 1 }, { unique: true });
 const RateLimit = mongoose.model("RateLimit", rateLimitSchema);
+
+// ShareUnlock schema for deferred unlock via referral
+const shareUnlockSchema = new mongoose.Schema({
+  messageId: { type: mongoose.Schema.Types.ObjectId, ref: "Message", required: true },
+  userId: { type: Number, required: true },
+  refCode: { type: String, required: true, unique: true },
+  used: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+const ShareUnlock = mongoose.model("ShareUnlock", shareUnlockSchema);
 
 // ========== HELPERS ==========
 function generateToken() {
@@ -159,6 +168,10 @@ async function generateFriendPortrait(userId, userDisplayName) {
 // ========== BOT INSTANCE ==========
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+// Crash protection
+process.on("unhandledRejection", (reason) => console.error("❌ Unhandled Rejection:", reason));
+process.on("uncaughtException", (err) => console.error("❌ Uncaught Exception:", err));
+
 bot.getMe().then((me) => {
   cachedBotUsername = me.username;
   console.log(`🤖 Bot started as @${cachedBotUsername}`);
@@ -167,9 +180,7 @@ bot.getMe().then((me) => {
 // ========== EXPRESS SERVER ==========
 const app = express();
 app.use(express.static('public'));
-
 app.get("/", (req, res) => res.send("✅ Bot is running"));
-
 app.listen(PORT, () => console.log(`Express server running on port ${PORT}`));
 
 // ========== COMMANDS ==========
@@ -184,12 +195,59 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     cachedBotUsername = me.username;
   }
 
+  // Handle share unlock links (deferred unlock)
+  if (param && param.startsWith("unlock_")) {
+    const refCode = param.split("_")[1];
+    const shareUnlock = await ShareUnlock.findOne({ refCode, used: false });
+    if (shareUnlock) {
+      const message = await Message.findById(shareUnlock.messageId);
+      if (message && message.status === "pending") {
+        message.status = "unlocked";
+        message.unlockMethod = "share";
+        message.unlockedAt = new Date();
+        await message.save();
+        shareUnlock.used = true;
+        await shareUnlock.save();
+        
+        // Notify the original user
+        try {
+          await bot.sendMessage(shareUnlock.userId, `🎉 Great news! Someone joined using your share link, so a pending message has been unlocked:\n\n*"${message.preview}"*\n\nUse /mymessages to read the full message.`, { parse_mode: "Markdown" });
+        } catch(e) {}
+        
+        await bot.sendMessage(chatId, `✅ Thanks for joining! You have unlocked a message for the person who shared this link. Now you can also get your own inbox.`);
+        // Now continue to create user account for this new joiner
+        const token = await ensureUser(userId, username);
+        const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
+        await bot.sendMessage(chatId, `🎉 *Your anonymous inbox is ready!*\n\nShare this link to receive messages: ${profileLink}`, { parse_mode: "Markdown" });
+        return;
+      } else {
+        await bot.sendMessage(chatId, `⚠️ This unlock link has already been used or the message no longer exists.`);
+        // Still create account for them
+        const token = await ensureUser(userId, username);
+        const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
+        await bot.sendMessage(chatId, `🎉 *Your anonymous inbox is ready!*\n\nShare this link to receive messages: ${profileLink}`, { parse_mode: "Markdown" });
+        return;
+      }
+    } else {
+      await bot.sendMessage(chatId, `❌ Invalid or expired unlock link. Starting your inbox anyway...`);
+      const token = await ensureUser(userId, username);
+      const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
+      await bot.sendMessage(chatId, `🎉 *Your anonymous inbox is ready!*\n\nShare this link to receive messages: ${profileLink}`, { parse_mode: "Markdown" });
+      return;
+    }
+  }
+
+  // Handle normal referral (if any) - ignore for now
   if (param && param.startsWith("ref_")) {
     await bot.sendMessage(chatId, `👋 Welcome! Your inbox is ready. Share your link to start receiving anonymous messages.`);
+    const token = await ensureUser(userId, username);
+    const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
+    await bot.sendMessage(chatId, `🔗 Your link: ${profileLink}`, { disable_web_page_preview: true });
     return;
   }
 
-  if (param && !param.startsWith("ref_")) {
+  // Handle direct message token (someone wants to send a message to a user)
+  if (param && !param.startsWith("ref_") && !param.startsWith("unlock_")) {
     const user = await getUserByToken(param);
     if (user) {
       const keyboard = {
@@ -202,6 +260,7 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
     }
   }
 
+  // Default /start - create user and show share buttons
   const token = await ensureUser(userId, username);
   const profileLink = `https://t.me/${cachedBotUsername}?start=${token}`;
   const shareButtons = {
@@ -221,14 +280,13 @@ bot.onText(/\/start(?: (.+))?/, async (msg, match) => {
       ]
     }
   };
-
   await bot.sendMessage(chatId,
-    `🎉 *Your anonymous inbox is ready!*\n\nShare your link with friends, followers, or anyone using the buttons below. They can send you anonymous messages. You'll get a blurred preview and can unlock each message for free (by sharing the bot) or with Telegram Stars.\n\n📊 Use /status to see pending messages.\n🎁 Use /random to send an anonymous message to a random user.\n🏆 Use /rank to see leaderboard.\n💡 Use /portrait to generate a shareable friend portrait (after 5+ messages).`,
+    `🎉 *Your anonymous inbox is ready!*\n\nShare your link with friends, followers, or anyone using the buttons below. They can send you anonymous messages. You'll get a preview and can unlock each message for free (by sharing a unique link) or with Telegram Stars.\n\n📊 Use /status to see pending messages.\n🎁 Use /random to send an anonymous message.\n🏆 Use /rank for leaderboard.\n💡 Use /portrait for a friend portrait.`,
     { parse_mode: "Markdown", ...shareButtons }
   );
 });
 
-// UPDATED /status - shows a button to view pending messages
+// /status - shows stats and button to view pending
 bot.onText(/\/status/, async (msg) => {
   const userId = msg.from.id;
   const pending = await Message.countDocuments({ receiverId: userId, status: "pending" });
@@ -244,7 +302,7 @@ bot.onText(/\/status/, async (msg) => {
   );
 });
 
-// UPDATED /mymessages - shows each message with unlock buttons
+// /mymessages - list last 10 messages with unlock buttons
 bot.onText(/\/mymessages/, async (msg) => {
   const userId = msg.from.id;
   const messages = await Message.find({ receiverId: userId }).sort({ createdAt: -1 }).limit(10);
@@ -272,6 +330,7 @@ bot.onText(/\/mymessages/, async (msg) => {
   }
 });
 
+// /random - send anonymous message to random active user
 bot.onText(/\/random/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -284,6 +343,7 @@ bot.onText(/\/random/, async (msg) => {
   global.pendingRandomTarget = activeUser.userId;
 });
 
+// /rank - leaderboard
 bot.onText(/\/rank/, async (msg) => {
   const topUsers = await User.aggregate([
     { $lookup: { from: "messages", localField: "userId", foreignField: "receiverId", as: "msgs" } },
@@ -299,6 +359,7 @@ bot.onText(/\/rank/, async (msg) => {
   await bot.sendMessage(msg.chat.id, text, { parse_mode: "Markdown" });
 });
 
+// /portrait
 bot.onText(/\/portrait/, async (msg) => {
   const userId = msg.from.id;
   const user = await User.findOne({ userId });
@@ -311,6 +372,7 @@ bot.onText(/\/portrait/, async (msg) => {
   }
 });
 
+// /stats - owner only
 bot.onText(/\/stats/, async (msg) => {
   if (msg.from.id !== OWNER_ID) {
     await bot.sendMessage(msg.chat.id, "❌ You are not authorized.");
@@ -323,7 +385,7 @@ bot.onText(/\/stats/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `📊 *Bot Stats*\nUsers: ${totalUsers}\nMessages: ${totalMessages}\nPending unlocks: ${pendingMessages}\nStars paid: ${totalStarsPaid}`, { parse_mode: "Markdown" });
 });
 
-// ========== MESSAGE HANDLER ==========
+// ========== MESSAGE HANDLER (for sending messages) ==========
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -348,7 +410,7 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ========== CALLBACK QUERY ==========
+// ========== CALLBACK QUERY HANDLER ==========
 bot.on("callback_query", async (query) => {
   const data = query.data;
   const chatId = query.message.chat.id;
@@ -386,43 +448,61 @@ bot.on("callback_query", async (query) => {
     await bot.answerCallbackQuery(query.id);
   }
 
+  // DEFERRED SHARE UNLOCK: generate unique link, don't unlock yet
   else if (data.startsWith("unlock_share_")) {
-    const messageId = data.split("_")[2];
-    const message = await Message.findById(messageId);
-    if (!message || message.status !== "pending") return;
-
-    message.status = "unlocked";
-    message.unlockMethod = "share";
-    message.unlockedAt = new Date();
-    await message.save();
-
-    const user = await User.findOne({ userId });
-    const refLink = `https://t.me/${cachedBotUsername}?start=ref_${user.userId}`;
-    
-    await bot.editMessageText(`📩 *Anonymous message (unlocked)*\n\n*"${message.content}"*`, {
-      chat_id: chatId,
-      message_id: query.message.message_id,
-      parse_mode: "Markdown"
-    });
-    await bot.sendMessage(chatId, `🎉 Message unlocked! Share your link: ${refLink}`, { disable_web_page_preview: true });
+    try {
+      const messageId = data.split("_")[2];
+      const message = await Message.findById(messageId);
+      if (!message || message.status !== "pending") {
+        await bot.answerCallbackQuery(query.id, { text: "Message already unlocked or not found." });
+        return;
+      }
+      // Create a unique referral code for this message
+      const refCode = crypto.randomBytes(8).toString("hex");
+      await ShareUnlock.create({
+        messageId: message._id,
+        userId: userId,
+        refCode: refCode,
+        used: false
+      });
+      const inviteLink = `https://t.me/${cachedBotUsername}?start=unlock_${refCode}`;
+      await bot.sendMessage(chatId,
+        `🔗 *Share this link with anyone*\n\nWhen they open this link and start the bot, *your message will be unlocked automatically* (for free).\n\n${inviteLink}`,
+        { parse_mode: "Markdown", disable_web_page_preview: true }
+      );
+      await bot.answerCallbackQuery(query.id, { text: "Link created! Share it to unlock." });
+    } catch (err) {
+      console.error("Share unlock error:", err);
+      await bot.answerCallbackQuery(query.id, { text: "Failed to create share link." });
+    }
   }
 
+  // STARS UNLOCK with try-catch to prevent crash
   else if (data.startsWith("unlock_stars_")) {
-    const messageId = data.split("_")[2];
-    const message = await Message.findById(messageId);
-    if (!message || message.status !== "pending") return;
-    const invoice = {
-      chat_id: chatId,
-      title: "Unlock Anonymous Message",
-      description: `Read: "${message.preview}..."`,
-      payload: `unlock_pay_${messageId}`,
-      provider_token: "",
-      currency: "XTR",
-      prices: [{ label: "Unlock", amount: 1500 }],
-      start_parameter: "unlock"
-    };
-    await bot.sendInvoice(invoice);
-    await bot.answerCallbackQuery(query.id);
+    try {
+      const messageId = data.split("_")[2];
+      const message = await Message.findById(messageId);
+      if (!message || message.status !== "pending") {
+        await bot.answerCallbackQuery(query.id, { text: "Message already unlocked or not found." });
+        return;
+      }
+      const invoice = {
+        chat_id: chatId,
+        title: "🔓 Unlock Anonymous Message",
+        description: `Read: "${message.preview.substring(0, 50)}..."`,
+        payload: `unlock_pay_${messageId}`,
+        provider_token: "",
+        currency: "XTR",
+        prices: [{ label: "Unlock full message", amount: 1500 }],
+        start_parameter: "unlock_stars"
+      };
+      await bot.sendInvoice(invoice);
+      await bot.answerCallbackQuery(query.id);
+    } catch (err) {
+      console.error("Stars invoice error:", err);
+      await bot.answerCallbackQuery(query.id, { text: "Payment failed. Please try again later." });
+      await bot.sendMessage(chatId, "❌ Unable to process Stars payment. You can still use 'Unlock by sharing' for free.");
+    }
   }
 
   else if (data.startsWith("copy_link_")) {
@@ -455,6 +535,8 @@ bot.on("successful_payment", async (msg) => {
       await message.save();
       await new Payment({ userId, transactionId: msg.successful_payment.telegram_payment_charge_id, amountStars, type: "unlock", messageId: message._id }).save();
       await bot.sendMessage(msg.chat.id, `🎉 *Message unlocked!*\n\n*"${message.content}"*`, { parse_mode: "Markdown" });
+    } else {
+      await bot.sendMessage(msg.chat.id, "❌ Message could not be unlocked. It may have already been unlocked.");
     }
   }
 });
@@ -463,6 +545,9 @@ bot.on("successful_payment", async (msg) => {
 setInterval(async () => {
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   await RateLimit.deleteMany({ date: { $lt: yesterday } });
+  // Also delete old unused share unlock codes after 7 days
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  await ShareUnlock.deleteMany({ used: true, createdAt: { $lt: weekAgo } });
 }, 24 * 60 * 60 * 1000);
 
-console.log("🤖 Bot started...");
+console.log("🤖 Bot started with full features (deferred share unlock + stars unlock)");
